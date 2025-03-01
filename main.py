@@ -12,20 +12,6 @@ from typing import List, Tuple
 from tqdm import tqdm
 import random
 import torch.nn.functional as F
-from collections import defaultdict
-
-'''ResNet in PyTorch.
-
-For Pre-activation ResNet, see 'preact_resnet.py'.
-
-Reference:
-[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
-    Deep Residual Learning for Image Recognition. arXiv:1512.03385
-'''
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -54,43 +40,10 @@ class BasicBlock(nn.Module):
         out = F.relu(out)
         return out
 
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, in_planes, planes, stride=1):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
-                               stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, self.expansion *
-                               planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion*planes)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion*planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-
-
 class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10):
         super(ResNet, self).__init__()
         self.in_planes = 64
-
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3,
                                stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
@@ -119,45 +72,46 @@ class ResNet(nn.Module):
         out = self.linear(out)
         return out
 
-###########################
-# 1) Utility Functions
-###########################
-def cross_entropy_for_onehot(pred, target):
-    """
-    Computes cross-entropy loss with one-hot target.
-    """
-    return torch.mean(torch.sum(- target * F.log_softmax(pred, dim=-1), 1))
+def visualize_results(original_batch, reconstructed_batch, mse_values, psnr_values, batch_idx):
+    batch_size = len(original_batch)
+    original_batch = torch.clamp(original_batch, 0, 1)
+    reconstructed_batch = torch.clamp(reconstructed_batch, 0, 1)
+    
+    if batch_size > 1:
+        fig, axes = plt.subplots(2, batch_size, figsize=(batch_size * 3, 6))
+    else:
+        fig, axes = plt.subplots(2, 1, figsize=(4, 6))
+        axes = np.expand_dims(axes, axis=1)  # Make it indexable like a 2D array
+    
+    for i in range(batch_size):
+        axes[0, i].imshow(original_batch[i].permute(1,2,0).cpu().numpy())
+        axes[0, i].axis("off")
+        if i == 0:
+            axes[0, i].set_ylabel("Ground Truth", fontsize=12, fontweight='bold')
+        
+        axes[1, i].imshow(reconstructed_batch[i].permute(1,2,0).cpu().numpy())
+        axes[1, i].axis("off")
+        if i == 0:
+            axes[1, i].set_ylabel("Reconstructed", fontsize=12, fontweight='bold')
+        axes[1, i].set_title(f"MSE: {mse_values[i]:.4f}\nPSNR: {psnr_values[i]:.2f}", fontsize=9)
 
-def label_to_onehot(target, num_classes=10):
-    target = torch.unsqueeze(target, 1)
-    onehot_target = torch.zeros(target.size(0), num_classes, device=target.device)
-    onehot_target.scatter_(1, target, 1)
-    return onehot_target
+    plt.tight_layout()
+    save_path = f"reconstruction_batch_{batch_idx+1}.png"
+    plt.savefig(save_path)
+    print(f"Saved visualization: {save_path}")
+    plt.close(fig)
 
-###########################
-# 2) LeNet Model
-###########################
-class LeNet(nn.Module):
-    def __init__(self):
-        super(LeNet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1   = nn.Linear(16*5*5, 120)
-        self.fc2   = nn.Linear(120, 84)
-        self.fc3   = nn.Linear(84, 10)
 
-    def forward(self, x):
-        out = F.relu(self.conv1(x))
-        out = F.max_pool2d(out, 2)
-        out = F.relu(self.conv2(out))
-        out = F.max_pool2d(out, 2)
-        out = out.view(out.size(0), -1)
-        out = F.relu(self.fc1(out))
-        out = F.relu(self.fc2(out))
-        out = self.fc3(out)
-        return out
+def mse_metric(original_data, reconstructed_data):
+    return (original_data - reconstructed_data).pow(2).mean().item()
 
-###########################
+def psnr_metric(original_data, reconstructed_data):
+    mse_val = mse_metric(original_data, reconstructed_data)
+    if mse_val == 0:
+        return 100
+    max_pixel = 1.0
+    return 20 * log10(max_pixel / (mse_val ** 0.5))
+
 # 3) DLG Attack
 ###########################
 class DLGAttack:
@@ -232,9 +186,9 @@ class IGAttack:
 
     def __init__(self,
                  model: nn.Module,
-                 max_iterations=4800,
+                 max_iterations=24000,
                  lr=0.1,
-                 tv_weight=1e-1,
+                 tv_weight=0,
                  device='cuda'):
         self.model = model
         self.model.eval()
@@ -330,7 +284,7 @@ class IGAttack:
             scheduler.step()
 
             # Print progress every 50 iters
-            if (it+1) % 50 == 0 or it == 0:
+            if (it+1) % 100 == 0 or it == 0:
                 lr_current = scheduler.optimizer.param_groups[0]['lr']
                 print(f"[IG] Iter {it+1}/{self.max_iterations}, cost={cost_val.item():.6f}, lr={lr_current}")
 
@@ -340,9 +294,6 @@ class IGAttack:
 
         return dummy_data.detach()
 
-###########################
-# 5) Helper Functions
-###########################
 def extract_gradients(model, data, labels, device='cuda'):
     """
     Return the ground-truth gradients given a data-label pair.
@@ -358,124 +309,59 @@ def extract_gradients(model, data, labels, device='cuda'):
     gradients = torch.autograd.grad(loss, model.parameters())
     return [g.detach().clone() for g in gradients]
 
-def visualize_results(original_batch, reconstructed_batch, mse_values, psnr_values, batch_idx, mean, std):
+def cross_entropy_for_onehot(pred, target):
     """
-    Generates and saves a figure showing the ground truth (top row)
-    and reconstructed (bottom row).
+    Computes cross-entropy loss with one-hot target.
     """
-    batch_size = len(original_batch)
-    original_batch = torch.clamp(original_batch, 0, 1)
-    reconstructed_batch = torch.clamp(reconstructed_batch, 0, 1)
+    return torch.mean(torch.sum(- target * F.log_softmax(pred, dim=-1), 1))
 
-    if batch_size > 1:
-        fig, axes = plt.subplots(2, batch_size, figsize=(15, 6))
-    else:
-        fig, axes = plt.subplots(2, 1, figsize=(4, 5))
-        axes = axes.reshape(2, 1)
+def label_to_onehot(target, num_classes=10):
+    target = torch.unsqueeze(target, 1)
+    onehot_target = torch.zeros(target.size(0), num_classes, device=target.device)
+    onehot_target.scatter_(1, target, 1)
+    return onehot_target
 
-    for i in range(batch_size):
-        # Ground Truth
-        axes[0, i].imshow(original_batch[i].permute(1,2,0).cpu().numpy())
-        axes[0, i].axis("off")
-        if i == 0:
-            axes[0, i].set_ylabel("Ground Truth", fontsize=12, fontweight='bold')
-
-        # Reconstructed
-        axes[1, i].imshow(reconstructed_batch[i].permute(1,2,0).cpu().numpy())
-        axes[1, i].axis("off")
-        if i == 0:
-            axes[1, i].set_ylabel("Reconstructed", fontsize=12, fontweight='bold')
-        axes[1, i].set_title(f"MSE: {mse_values[i]:.4f}\nPSNR: {psnr_values[i]:.2f}", fontsize=9)
-
-    fig.suptitle(f"Batch {batch_idx+1}: GT vs. Recon", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_path = f"reconstruction_batch_{batch_idx+1}.png"
-    plt.savefig(save_path)
-    print(f"Saved visualization: {save_path}")
-    plt.close(fig)
-
-def mse_metric(original_data, reconstructed_data):
-    return (original_data - reconstructed_data).pow(2).mean().item()
-
-def psnr_metric(original_data, reconstructed_data):
-    mse_val = mse_metric(original_data, reconstructed_data)
-    if mse_val == 0:
-        return 100
-    max_pixel = 1.0
-    return 20 * log10(max_pixel / (mse_val ** 0.5))
-
-###########################
-# 6) Main Attack Execution
-###########################
+# -------------- Main Function -------------- #
 def main():
     parser = argparse.ArgumentParser(description="Data Reconstruction Attack")
-    parser.add_argument("--attack", type=str, default="dlg", choices=["dlg", "ig"])
-    parser.add_argument("--model", type=str, default="lenet", choices=["lenet"])
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10"])
-    parser.add_argument("--num_rounds", type=int, default=300, help="Number of iterations")
-    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--attack", type=str, required=True, choices=["dlg", "ig"])
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--device", type=str, default="cuda", help="cpu or cuda")
+    parser.add_argument("--num_rounds", type=int, default=4000)
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
-
-    device = args.device if torch.cuda.is_available() and args.device=='cuda' else 'cpu'
+    
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-
-    # 1) Setup model
-    model = ResNet(BasicBlock, [2, 2, 2, 2]).to(device) #LeNet().to(device)
+    
+    model = ResNet(BasicBlock, [2, 2, 2, 2]).to(device)
     model.eval()
-
-    # 2) CIFAR-10
+    
     transform = transforms.Compose([transforms.ToTensor()])
     dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-
-    num_batches = args.num_batches
-    num_images_per_batch = args.batch_size
-    subset_indices = random.sample(range(len(dataset)), k=num_images_per_batch)
-    subset_data = Subset(dataset, subset_indices)
-    loader = DataLoader(subset_data, batch_size=num_images_per_batch, shuffle=False)
-
-    # 3) Prepare the chosen attack
+    
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
     if args.attack == "dlg":
-        print(">> Using DLG Attack (L2 cost, LBFGS).")
-        attack = DLGAttack(model, num_iterations=args.num_rounds, lr=args.lr)
+        lr = 1
     elif args.attack == "ig":
-        print(">> Using IG Attack (1 - cosSim + TV, Adam w/ decay, iDLG labels).")
-        attack = IGAttack(model, max_iterations=args.num_rounds, lr=args.lr, tv_weight=0, device=device)
-
-    # 4) Attack the batch
+        lr = 0.1
+    else:
+        raise ValueError("Attack not implemented")
+    
+    attack = DLGAttack(model, args.num_rounds, lr) if args.attack == "dlg" else IGAttack(model, args.num_rounds, lr, device=device)
+    
     for idx, (data, labels) in enumerate(loader):
-        if idx >= num_batches:
+        if idx >= args.num_batches:
             break
-
         data, labels = data.to(device), labels.to(device)
-        # Extract "real" gradients from the model
         real_gradients = extract_gradients(model, data, labels, device=device)
-
-        # Reconstruct
-        if args.attack == "dlg":
-            # DLG uses known labels from the dataset
-            reconstructed = attack.reconstruct_data(real_gradients, labels, data.shape[1:], idx, device)
-        else:
-            # IG can optionally do iDLG label guess if we pass `labels=None`.
-            # If you want to forcibly use the iDLG trick, call with None.
-            # Otherwise, pass the ground-truth label to skip label guessing.
-            use_idlg_label = True  # set True if you want to pretend label is unknown
-            if use_idlg_label:
-                reconstructed = attack.reconstruct_data(real_gradients, None, data.shape[1:])
-            else:
-                reconstructed = attack.reconstruct_data(real_gradients, labels, data.shape[1:])
-
-        # Evaluate metrics & visualize
-        mse_values, psnr_values = [], []
-        for i in range(data.size(0)):
-            mse_val = mse_metric(data[i], reconstructed[i])
-            psnr_val = psnr_metric(data[i], reconstructed[i])
-            mse_values.append(mse_val)
-            psnr_values.append(psnr_val)
-
-        visualize_results(data, reconstructed, mse_values, psnr_values, idx, mean=[0,0,0], std=[1,1,1])
+        reconstructed = attack.reconstruct_data(real_gradients, labels, data.shape[1:])
+        
+        mse_values = [mse_metric(data[i], reconstructed[i]) for i in range(data.size(0))]
+        psnr_values = [psnr_metric(data[i], reconstructed[i]) for i in range(data.size(0))]
+        
+        visualize_results(data, reconstructed, mse_values, psnr_values, idx)
 
 if __name__ == "__main__":
     main()
