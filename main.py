@@ -14,6 +14,7 @@ import random
 import torch.nn.functional as F
 
 import torchvision.models as models
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import pdb
 
 # ------------------------
@@ -129,7 +130,7 @@ class ResNet(nn.Module):
 def ResNet18(num_classes=10):
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
 
-def ResNet50(num_classes=10):
+def ResNet50(num_classes=1000):
     return ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
 
 # ---------------------------
@@ -137,9 +138,8 @@ def ResNet50(num_classes=10):
 # ---------------------------
 def visualize_results(original_batch, reconstructed_batch, mse_values, psnr_values, batch_idx, exp_name):
     batch_size = len(original_batch)
-    original_batch = torch.clamp(original_batch, 0, 1)
+    original_batch = torch.clamp(original_batch, 0, 1) 
     reconstructed_batch = torch.clamp(reconstructed_batch, 0, 1)
-    
     if batch_size > 1:
         fig, axes = plt.subplots(2, batch_size, figsize=(batch_size * 3, 6))
     else:
@@ -194,6 +194,7 @@ class DLGAttack:
         original_data,
         gradients: List[torch.Tensor],
         labels: torch.Tensor,
+        num_classes: int,
         input_shape: Tuple[int],
         batch_idx: int,
         exp_name = ''
@@ -262,7 +263,7 @@ class IGAttack:
         label_idx = torch.argmin(sums, dim=-1).reshape((1,))
         return label_idx
 
-    def reconstruct_data(self, origianl_data, real_gradients, labels, input_shape, batch_idx=0, exp_name=''):
+    def reconstruct_data(self, origianl_data, real_gradients, labels, num_classes, input_shape, batch_idx=0, exp_name=''):
         if labels is None:
             guessed_label = self._idlg_label_guess(real_gradients).to(self.device)
             print(f"[IG] Recovered label via iDLG: {guessed_label.item()}")
@@ -335,11 +336,11 @@ class GradInversionAttack:
         model: nn.Module,
         max_iterations=2000,
         lr=0.1,
-        alpha_tv=0,     # weight for total variation
-        alpha_l2=0,     # weight for L2-norm regularization
-        alpha_bn=0,     # weight for BatchNorm-statistics matching
-        alpha_group=0,  # weight for group consistency
-        alpha_n = 0,
+        alpha_tv=1e-6,#1e-4,     # weight for total variation
+        alpha_l2=1e-6,#1e-6,     # weight for L2-norm regularization
+        alpha_bn=1e-5,#5e-2,     # weight for BatchNorm-statistics matching
+        alpha_group=1e-4,  # weight for group consistency
+        alpha_n =1e-6,#1e-5,
         group_size=4,      # number of random seeds for multi-path search
         device='cuda'
     ):
@@ -391,7 +392,7 @@ class GradInversionAttack:
         # Mean & var of the BN input
         cur_mean = x.mean(dim=[0, 2, 3])
         cur_var  = x.var(dim=[0, 2, 3], unbiased=False)
-
+        
         self._batch_means[module] = cur_mean
         self._batch_vars[module]  = cur_var
         # We do NOT return anything here (forward_pre_hook returns None by default).
@@ -432,7 +433,9 @@ class GradInversionAttack:
         Weighted by alpha_bn.
         """
         bn_loss = 0.0
+        count = 0
         for bn_module in self._bn_layers:
+            count += 1
             # The module’s official running mean/var
             running_mean = bn_module.running_mean.detach()
             running_var  = bn_module.running_var.detach()
@@ -443,7 +446,6 @@ class GradInversionAttack:
 
             bn_loss += F.mse_loss(cur_mean, running_mean, reduction='sum')
             bn_loss += F.mse_loss(cur_var,  running_var,  reduction='sum')
-
         return self.alpha_bn * bn_loss
 
     def _total_variation(self, x):
@@ -468,7 +470,7 @@ class GradInversionAttack:
         consensus = stacked.mean(dim=0)  # shape [B, C, H, W]
         return consensus
 
-    def reconstruct_data(self, original_data, real_gradients, labels, input_shape, batch_idx=0, exp_name=''):
+    def reconstruct_data(self, original_data, real_gradients, labels, num_classes, input_shape, batch_idx=0, exp_name=''):
         # If unknown labels, attempt single-label restoration
         if labels is None:
             guessed_label = self._recover_labels_if_needed(real_gradients)
@@ -490,13 +492,15 @@ class GradInversionAttack:
             dummy_data_list.append(init)
 
         # Convert labels to one-hot
-        num_classes = 1000
+        device = 'cuda'
+        
         onehot = torch.zeros(labels.size(0), num_classes, device=labels.device)
         onehot.scatter_(1, labels.unsqueeze(1), 1.0)
         
 
         # Single optimizer for all seeds
         optimizer = torch.optim.Adam(dummy_data_list, lr=self.lr)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.max_iterations, eta_min=1e-5)
 
         print(f"[GradInv] Reconstructing batch {batch_idx+1}, group_size={self.group_size}")
 
@@ -509,9 +513,10 @@ class GradInversionAttack:
             # STEP 2) For each seed: compute grad match + fidelity
             # ---------------------------
             for dummy_data in dummy_data_list:
-                self.model.train()
+                self.model.eval()
                 outputs = self.model(dummy_data)
-                ce_loss = cross_entropy_for_onehot(outputs, onehot)
+                #ce_loss = cross_entropy_for_onehot(outputs, onehot)
+                ce_loss = nn.CrossEntropyLoss()(outputs, labels)
                 dummy_grad = torch.autograd.grad(ce_loss, self.model.parameters(), create_graph=True)
 
                 grad_loss = self._compute_grad_match_loss(dummy_grad, real_gradients)
@@ -538,12 +543,12 @@ class GradInversionAttack:
             total_loss.backward()
             optimizer.step()
 
-            # with torch.no_grad():
-            #     for dummy_data in dummy_data_list:
-            #         # Add pixel-wise Gaussian noise scaled by lr * alpha_n
-            #         noise = torch.randn_like(dummy_data)
-            #         dummy_data.add_(self.lr * self.alpha_n, noise)
-            #         dummy_data.clamp_(0, 1)
+            with torch.no_grad():
+                for dummy_data in dummy_data_list:
+                    # Add pixel-wise Gaussian noise scaled by lr * alpha_n
+                    noise = torch.randn_like(dummy_data)
+                    dummy_data.add_(self.lr * self.alpha_n, noise)
+                    dummy_data.clamp_(0, 1)
 
             if (it+1) % 100 == 0 or it == 0:
                 print(f"[GradInv] Iter {it+1}/{self.max_iterations}, total_loss={total_loss.item():.6f}")
@@ -587,6 +592,7 @@ def main():
     parser.add_argument("--arch", type=str, default="resnet18", choices=["resnet18", "resnet50"],
                         help="Choose model architecture for the experiment")
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenet"])
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_rounds", type=int, default=4000)
@@ -627,28 +633,30 @@ def main():
     model.eval()
 
     if args.dataset == 'cifar10':
-        transform = transforms.Compose([transforms.ToTensor()])
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
         dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        
     elif args.dataset == 'imagenet':
     ## load imagenet
         transform = transforms.Compose([
             transforms.Resize((224, 224)),  # Resize images to 224x224
             transforms.ToTensor(),          # Convert images to tensors
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize
         ])
         dataset = torchvision.datasets.ImageFolder(root='../imagenet_samples', transform=transform)
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-
+        
     # Set LR based on chosen attack (feel free to adjust)
     if args.attack == "dlg":
-        lr = 1
+        lr = 1 if args.lr == None else args.lr
         attack = DLGAttack(model, args.num_rounds, lr)
     elif args.attack == "ig":
-        lr = 0.1
+        lr = 0.1 if args.lr == None else args.lr
         attack = IGAttack(model, args.num_rounds, lr, device=device)
     else:  # gi
-        lr = 1
+        lr = 0.005 if args.lr == None else args.lr
         attack = GradInversionAttack(model=model, max_iterations=args.num_rounds, lr=lr, device=device)
 
     # Run for the specified number of batches
@@ -656,13 +664,10 @@ def main():
         if idx >= args.num_batches:
             break
 
-        data, labels = data.to(device), labels.to(device)
-        
-        num_classes = 1000 if args.dataset == 'imagenet' else 10
-
+        data, labels = data.to(device), labels.to(device)     
+        num_classes = 1000 if args.dataset == 'imagenet' else 10      
         # Extract real gradients
-        real_gradients = extract_gradients(model, data, labels, num_classes, device=device)
-        
+        real_gradients = extract_gradients(model, data, labels, num_classes, device=device)      
         # If using GradInversion, we may optionally do a forward pass on real data
         # to record real BN features. For minimal example:
         if args.attack == "gi":
@@ -672,9 +677,9 @@ def main():
 
         # Reconstruct
         reconstructed = attack.reconstruct_data(
-            data, real_gradients, labels, data.shape[1:], batch_idx=idx, exp_name=args.exp
+            data, real_gradients, labels, num_classes, data.shape[1:], batch_idx=idx, exp_name=args.exp
         )
-
+        
         # Evaluate MSE/PSNR
         mse_values = [mse_metric(data[i], reconstructed[i]) for i in range(data.size(0))]
         psnr_values = [psnr_metric(data[i], reconstructed[i]) for i in range(data.size(0))]
